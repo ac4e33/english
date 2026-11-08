@@ -120,7 +120,7 @@
   function sayText(text, box) {
     var rate = R.rate || 0.95;
     var hl = highlighter(box, rate);
-    speak(text, rate, function () { hl.stop(); }, hl.word);
+    speak(text, rate, function (ok) { hl.stop(); if (ok === false) audioHelp(); }, hl.word);
     curHL = hl;
     hl.start();
   }
@@ -139,12 +139,29 @@
   }
 
   // ---------- speech ----------
-  var tts = { ok: 'speechSynthesis' in window, playing: false, failed: false };
+  var tts = { ok: 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window, playing: false, failed: false, token: 0, held: [] };
+  // Phones load their voice list late, so ask for it as soon as the app opens.
+  if (tts.ok) { try { window.speechSynthesis.getVoices(); window.speechSynthesis.addEventListener('voiceschanged', function () {}); } catch (e) {} }
   function voices() {
     if (!tts.ok) return [];
     var v = window.speechSynthesis.getVoices().filter(function (x) { return /^en/i.test(x.lang); });
-    v.sort(function (a, b) { return (/en-GB/i.test(b.lang) ? 1 : 0) - (/en-GB/i.test(a.lang) ? 1 : 0); });
+    // Voices that need a download or a connection often stay silent on phones.
+    var local = v.filter(function (x) { return x.localService; });
+    if (local.length) v = local;
+    v.sort(function (a, b) { return (/en[-_]GB/i.test(b.lang) ? 1 : 0) - (/en[-_]GB/i.test(a.lang) ? 1 : 0); });
     return v;
+  }
+  function hideAudioHelp() { var b = document.getElementById('audio-help'); if (b) b.remove(); }
+  function audioHelp() {
+    if (document.getElementById('audio-help')) return;
+    var b = document.createElement('div');
+    b.id = 'audio-help'; b.setAttribute('role', 'alert');
+    b.style.cssText = 'position:fixed;left:12px;right:12px;bottom:calc(12px + env(safe-area-inset-bottom,0px));z-index:50;max-width:560px;margin:0 auto;background:var(--surface);color:var(--ink);border:2px solid var(--red);border-radius:10px;padding:14px 44px 14px 16px;font-size:.95rem;line-height:1.45;box-shadow:0 8px 30px rgba(0,0,0,.3)';
+    var ar = S.hints === 'off' ? '' : '<p dir="rtl" lang="ar" style="margin:8px 0 0">لا يوجد صوت. أوقفي الوضع الصامت وارفعي مستوى الصوت. افتحي الرابط في Chrome أو Safari، وليس داخل واتساب أو إنستغرام. وإذا استمرت المشكلة، ثبّتي اللغة الإنجليزية في إعدادات تحويل النص إلى كلام في هاتفك.</p>';
+    b.innerHTML = '<p style="margin:0"><b>No sound.</b> Turn off silent mode and turn up the volume. Open this link in Chrome or Safari, not inside WhatsApp or Instagram. If it still fails, install English in your phone\'s text-to-speech settings.</p>' + ar +
+      '<button aria-label="Close" style="position:absolute;top:6px;right:6px;width:36px;height:36px;background:none;border:0;color:var(--ink);font-size:1.3rem;cursor:pointer">&times;</button>';
+    b.querySelector('button').addEventListener('click', hideAudioHelp);
+    document.body.appendChild(b);
   }
   function waitForVoices() {
     return new Promise(function (resolve) {
@@ -156,7 +173,7 @@
       setTimeout(fin, 1800);
     });
   }
-  function stopSpeech() { if (tts.ok) window.speechSynthesis.cancel(); tts.playing = false; setPlayingUI(false); if (curHL) { curHL.stop(); curHL = null; } }
+  function stopSpeech() { tts.token++; if (tts.ok) window.speechSynthesis.cancel(); tts.playing = false; setPlayingUI(false); if (curHL) { curHL.stop(); curHL = null; } }
   function setPlayingUI(on) {
     var p = document.getElementById('player'); if (!p) return;
     p.classList.toggle('speaking', on);
@@ -166,29 +183,50 @@
   function speak(text, rate, onEnd, onWord) {
     if (curHL) { curHL.stop(); curHL = null; }
     if (!tts.ok) { if (onEnd) onEnd(false); return; }
-    window.speechSynthesis.cancel();
-    var vs = voices();
+    var ss = window.speechSynthesis, token = ++tts.token;
+    function live() { return token === tts.token; }
+    function finish(ok) { if (!live()) return; tts.token++; tts.held = []; if (onEnd) onEnd(ok); }
     var parts = [], who = 0, cursor = 0;
     text.split(/(?=\b[AB]: )/).forEach(function (seg) {
       var m = seg.match(/^([AB]): /);
       if (m) { who = m[1] === 'A' ? 0 : 1; seg = seg.slice(3); }
       (seg.match(/[^.!?]+[.!?]*\s*/g) || [seg]).forEach(function (s) { if (!s.trim()) return; var at = text.indexOf(s.trim(), cursor); cursor = at + s.trim().length; parts.push({ s: s.trim(), who: who, at: at }); });
     });
-    var i = 0;
-    function nextPart() {
-      if (i >= parts.length) { if (onEnd) onEnd(true); return; }
-      var u = new SpeechSynthesisUtterance(parts[i].s);
-      u.lang = vs[0] ? vs[0].lang : 'en-GB';
-      if (vs.length) u.voice = vs[Math.min(parts[i].who, vs.length - 1)];
-      if (vs.length < 2 && parts[i].who === 1) u.pitch = 1.35;
-      u.rate = rate || 0.95;
-      var base = parts[i].at;
-      if (onWord) u.onboundary = function (e) { if (!e.name || e.name === 'word') onWord(base + e.charIndex); };
-      u.onend = function () { i++; nextPart(); };
-      u.onerror = function (e) { if (e.error === 'canceled' || e.error === 'interrupted') return; if (onEnd) onEnd(false); };
-      window.speechSynthesis.speak(u);
+    if (!parts.length) { finish(true); return; }
+    // Try the best English voice first. If it fails or stays silent, try the phone's default.
+    function attempt(useVoice) {
+      var vs = useVoice ? voices() : [], started = false, failed = false;
+      function fail() {
+        if (failed || !live()) return;
+        failed = true;
+        if (!useVoice) { try { ss.cancel(); } catch (e) {} finish(false); return; }
+        try { ss.cancel(); } catch (e) {}
+        setTimeout(function () { if (live()) attempt(false); }, 150);
+      }
+      setTimeout(function () { if (!started) fail(); }, 6000);
+      try {
+        // Queued together, so the whole text belongs to the tap that started it. Phones require that.
+        tts.held = parts.map(function (p, n) {
+          var u = new SpeechSynthesisUtterance(p.s);
+          u.lang = vs[0] ? vs[0].lang.replace('_', '-') : 'en-US';
+          if (vs.length) u.voice = vs[Math.min(p.who, vs.length - 1)];
+          if (vs.length < 2 && p.who === 1) u.pitch = 1.35;
+          u.rate = rate || 0.95;
+          if (onWord) u.onboundary = function (e) { if (!failed && live() && (!e.name || e.name === 'word')) onWord(p.at + e.charIndex); };
+          u.onstart = function () { if (failed || !live()) return; started = true; hideAudioHelp(); };
+          u.onend = function () { if (failed || !live()) return; if (n === parts.length - 1) finish(true); };
+          u.onerror = function () { fail(); };
+          return u;
+        });
+        tts.held.forEach(function (u) { ss.speak(u); });
+      } catch (e) { fail(); }
     }
-    nextPart();
+    try { ss.resume(); } catch (e) {}
+    // Starting straight after cancelling is often dropped, so only pause when something is playing.
+    if (ss.speaking || ss.pending) {
+      ss.cancel();
+      setTimeout(function () { if (live()) attempt(true); }, 150);
+    } else attempt(true);
   }
   function playerHTML(q, mode) {
     var showText = q.showScript || !tts.ok;
@@ -411,7 +449,8 @@
   function startTest() {
     var start = S.tests.length ? S.tests[S.tests.length - 1].overall.mean : S.self;
     S.test = { responses: [], current: null, start: start, skip: [], ratings: [] };
-    waitForVoices().then(function (ok) { if (!ok) S.test.skip.push('listening'); nextTest(); });
+    // An empty voice list is normal on phones, so only leave listening out when speech does not exist at all.
+    waitForVoices().then(function () { if (!tts.ok) S.test.skip.push('listening'); nextTest(); });
   }
   function resumeTest() {
     if (S.test.current && ITEM_BY_ID[S.test.current]) { R.q = makeQ(ITEM_BY_ID[S.test.current]); viewTest(); }
@@ -1073,8 +1112,8 @@
         tts.playing = true; setPlayingUI(true);
         speak(q.item.script, R.rate || 0.95, function (ok) {
           tts.playing = false; setPlayingUI(false);
-          if (R.view === 'test') { if (ok) refreshPlays(q); else markNoAudio(); }
-          else if (!ok) { q.showScript = true; tts.failed = true; refreshQ(); }
+          if (R.view === 'test') { if (!ok) { q.plays = Math.max(0, (q.plays || 1) - 1); audioHelp(); } refreshPlays(q); }
+          else if (!ok) { q.showScript = true; tts.failed = true; audioHelp(); refreshQ(); }
         });
         break;
       case 'rate': R.rate = parseFloat(v); document.querySelectorAll('[data-a="rate"]').forEach(function (b) { b.setAttribute('aria-pressed', b === el); }); break;
